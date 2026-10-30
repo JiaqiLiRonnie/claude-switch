@@ -106,7 +106,9 @@ Extra flags: `--seed-vm` (also clone `vm_bundles`, ~10 GB of Cowork VM image; AP
 
 If your project folder path contains a symlink (for example `/Volumes/Disk/…` reached through `~/shortcut`), the same session id can end up with a transcript file in **two** folders under `~/.claude/projects/`: one named after the symlink path, one after the real path. Desktop may then render the older, truncated copy.
 
-This is a Claude Desktop / Claude Code behaviour, not something `claude-switch` creates (on the author's machine 13 of the 14 split sessions pre-date setting it up; the 14th appeared when the data-directory path changed), and it is tracked upstream:
+What we verified in Claude Desktop's code: when you resume a session, and its transcript sits in a different project folder than the one computed from the session's working directory, Desktop **copies** the transcript to the computed folder and **keeps the original**. Its log line is `Migrated transcript <id> from … to …`. That leaves two copies. Separately, forked / linked sessions (e.g. "(fork)", "btw: …") start with a copy of the parent's transcript, so their file contains lines carrying the parent's session id; that is a different thing from the same session id existing in two folders. What we have **not** verified: which copy the UI renders at a given moment (the author saw an older copy first and the newer one a while later), and whether keeping the old copy is intended.
+
+This is Claude Desktop / Claude Code behaviour, not something `claude-switch` creates (on the author's machine 13 of the 14 split sessions pre-date setting it up; the 14th appeared when the data-directory path changed), and it is tracked upstream:
 [anthropics/claude-code#103806](https://github.com/anthropics/claude-code/issues/103806),
 [#98899](https://github.com/anthropics/claude-code/issues/98899),
 [#98342](https://github.com/anthropics/claude-code/issues/98342),
