@@ -80,6 +80,11 @@ claude-switch use personal --go     # 之后随时免登录切换
 
 `claude-switch doctor` **只报告**。作者机器上每个分裂都是「较小的文件是较大文件的逐字节开头部分」，所以较大的那份是完整的；先备份它再做别的。经测试的自动修复在路线图里，刻意还没发布。
 
+## 常见问题
+
+**在另一个账号里打开老会话，Claude Code 提示「can't use thinking from another organization」，我丢东西了吗？**
+没有。提示里说明之前的思考内容没有被删除，只是它是在你登录另一个组织时生成的，当前组织无法复用。要重新用上，请登录原来的账号再续这个会话。如果仍在当前账号继续，Claude 会重新读一遍会话并生成新的思考，可能更慢、多花 token。这来自账号隔离，不是 `claude-switch` 造成的；本工具只是让另一个账号的会话出现在侧边栏里。背景见 [Preserved thinking](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking)。
+
 ## 已知限制
 
 来自真实使用的如实清单：

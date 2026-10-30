@@ -116,6 +116,11 @@ This is Claude Desktop / Claude Code behaviour, not something `claude-switch` cr
 
 `claude-switch doctor` only **reports**. On the author's machine every split was "the smaller file is a byte-for-byte prefix of the larger one", which makes the larger copy the complete one. Back that copy up before doing anything else. An automatic, tested repair is on the [roadmap](#roadmap); it is deliberately not shipped yet.
 
+## FAQ
+
+**I opened an old session from another account and Claude Code says it "can't use thinking from another organization". Did I lose anything?**
+No. The notice says the earlier thinking isn't deleted; it was produced while you were signed in to a different organization, so the current one can't reuse it. Resume the session while signed in to the original account to use it again. If you continue anyway, Claude re-reads the session and generates new thinking, which can be slower and use more tokens. This comes from account isolation, not from `claude-switch`; the tool only makes the other account's sessions visible in the sidebar. Background: [Preserved thinking](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking).
+
 ## Known limitations
 
 Honest list, from real use:
