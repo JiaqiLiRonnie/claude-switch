@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""claude-switch：Claude Desktop 多账号「登录态持久化 + 一键切换 + 会话索引合并」
+
+原理（已在沙盒里用真实 Claude.app 验证）：
+  登录态、Cookies、本地存储都在数据目录 ~/Library/Application Support/Claude 里。
+  把它改成一个符号链接，指向 Claude-Profiles/<档案名>/ ，每个账号一个档案目录；
+  切换 = 退出 Claude → 改链接指向 → 重新打开。每个档案各自保留登录态，不用重登。
+
+命令（改动类命令默认只预演，加 --go 才真正执行）：
+  status                  看当前状态（只读）
+  doctor                  体检（只读）：找出「索引里的工作目录」与「转录实际所在文件夹」对不上的会话
+  init <名字>   [--go]    首次：把现有数据目录改名为档案 <名字>，并在原位放符号链接
+  add <名字>    [--go]    新建一个空档案（用于另一个账号；首次切过去时登录一次）
+  use <名字>    [--go]    切换到某档案：退出 App → 合并会话索引 → 改链接 → 重新打开
+  sync          [--go]    只做「共享状态」同步（需先退出 App）：会话索引合并 + 无文件夹会话目录共享
+                          + 侧边栏分组/置顶/星标同步 + worktree 登记表合并
+  uninstall     [--go]    还原：把当前档案改回真实的 Claude 目录
+
+注意：
+  * 必须在 Terminal.app 里运行，不要在 Claude Desktop 内置终端或 Claude Code 里运行
+    （切换要退出 Claude，会连命令一起杀掉）。
+  * 会话索引合并规则：同名会话取 lastActivityAt 最大的一份；只合并 local_*.json，
+    不碰 scheduled-tasks.json 等其他文件；尊重 deleted_<id> 删除标记；
+    指针冲突（活动时间相同但转录文件不同）的会话不动，只报告。
+  * 共享状态（2026-10-30 补充）：每个档案是独立数据目录，下面这些不会自动互通，由本工具负责：
+      - scratch-workspaces / side-session-notes：无文件夹会话的工作目录和笔记。用符号链接指向
+        同一份真实目录，否则切到另一档案会报「Working folder no longer exists」。
+      - 侧边栏自定义分组、会话归属、置顶、星标：存在各档案的 claude_desktop_config.json 里。
+        以「当前正在用的档案」为准（它刚被你改过），复制给其他档案；源是空的不会覆盖对方。
+      - 少量无害的界面偏好（只补缺，不覆盖已有值）。权限/安全类设置不动。
+      - git-worktrees.json 里的 worktree 登记（并集），避免另一档案把它当成无主目录清理。
+  * 测试用环境变量：CLAUDE_SWITCH_ASUP（替代 ~/Library/Application Support）、
+    CLAUDE_SWITCH_TRASH、CLAUDE_SWITCH_TEST=1（不真正退出/启动 App）、
+    CLAUDE_SWITCH_FAKE_RUNNING=1（测试模式下假装 App 在运行）。
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ASUP = Path(os.environ.get("CLAUDE_SWITCH_ASUP") or Path.home() / "Library/Application Support")
+LIVE = ASUP / "Claude"
+ROOT = ASUP / "Claude-Profiles"
+TRASH = Path(os.environ.get("CLAUDE_SWITCH_TRASH") or Path.home() / ".Trash")
+TEST = os.environ.get("CLAUDE_SWITCH_TEST") == "1"
+APP_BIN = "/Applications/Claude.app/Contents/MacOS/Claude"
+SEED_DEFAULT = ["claude-code", "claude-code-vm"]       # App 通用的 CLI 组件，与账号无关
+SEED_VM = ["vm_bundles"]                              # Cowork 虚拟机镜像（约 10GB），需 --seed-vm
+KEEP_BACKUPS = 3
+PROJECTS = Path(os.environ.get("CLAUDE_SWITCH_PROJECTS") or Path.home() / ".claude/projects")
+RUN_TS = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+SHARED_DIRS = ["scratch-workspaces", "side-session-notes"]   # 与账号无关、按路径/会话 id 寻址的目录
+# 界面偏好：只在目标档案缺这个键时才补。权限、安全、按账号的键一律不碰。
+GAPFILL_TOP = ["keepAwakeEnabled"]
+GAPFILL_EP = ["cc-landing-worktree-enabled", "ccd-effort-level", "claude-code-preferred-editor",
+              "epitaxy-diff-tree-width", "epitaxy-files-tab-size", "epitaxy-files-tree-width",
+              "epitaxy-transcript-links-in-preview", "epitaxy-transcript-links-chooser-seen",
+              "epitaxy-split-suggestion", "epitaxy-spawn-task-target-v2"]
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+
+
+def die(msg):
+    print(f"❌ {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------- 进程检测 ----------
+def app_running():
+    """用 ps 精确匹配主进程。pgrep 在部分环境里看不到 Claude 主进程（2026-10-30 实测）。"""
+    if TEST:
+        return os.environ.get("CLAUDE_SWITCH_FAKE_RUNNING") == "1"
+    out = subprocess.run(["ps", "-axo", "command"], capture_output=True, text=True).stdout
+    return any(line.strip() == APP_BIN for line in out.splitlines())
+
+
+def inside_claude():
+    """本进程的祖先里有 Claude.app 或 Claude 自带的 claude-code，说明是从 Claude 里跑的。"""
+    if TEST:
+        return False
+    pid = os.getpid()
+    for _ in range(40):
+        r = subprocess.run(["ps", "-o", "ppid=,command=", "-p", str(pid)],
+                           capture_output=True, text=True).stdout.strip()
+        if not r:
+            return False
+        ppid, _, cmd = r.partition(" ")
+        if "/Applications/Claude.app/" in cmd or "Application Support/Claude/claude-code/" in cmd:
+            return True
+        try:
+            pid = int(ppid)
+        except ValueError:
+            return False
+        if pid <= 1:
+            return False
+    return False
+
+
+def require_quit():
+    if app_running():
+        die("Claude Desktop 还在运行，请先 Cmd+Q 完全退出后再执行。")
+
+
+def quit_app():
+    if not app_running():
+        return
+    if TEST:
+        die("（测试）App 退不出去。")
+    subprocess.run(["osascript", "-e", 'tell application "Claude" to quit'],
+                   capture_output=True, text=True)
+    for _ in range(60):
+        if not app_running():
+            time.sleep(2)           # 给辅助进程一点收尾时间
+            return
+        time.sleep(0.5)
+    die("Claude 没有在 30 秒内退出（可能有任务在运行或有未保存内容）。我没有强制结束它。"
+        "请手动 Cmd+Q 后重试。")
+
+
+def launch_app():
+    if TEST:
+        return
+    subprocess.run(["open", "-a", "Claude"])
+
+
+# ---------- 档案 ----------
+def profiles():
+    if not ROOT.is_dir():
+        return []
+    return [p.name for p in sorted(ROOT.iterdir())
+            if p.is_dir() and not p.is_symlink() and not p.name.startswith(("_", "."))]
+
+
+def active():
+    if not LIVE.is_symlink():
+        return None
+    t = LIVE.resolve()
+    return t.name if t.parent == ROOT.resolve() else None
+
+
+def check_name(name):
+    if not NAME_RE.match(name or ""):
+        die(f"档案名不合法：{name!r}（只能用字母、数字、_、-，以字母或数字开头，最长 32 位）")
+
+
+def check_init():
+    if active() is None:
+        die("还没有初始化。先运行：claude-switch init <给当前账号起的名字>")
+
+
+def to_trash(p):
+    """移到废纸篓，可恢复，不直接删除。"""
+    TRASH.mkdir(parents=True, exist_ok=True)
+    dst = TRASH / p.name
+    n = 1
+    while dst.exists():
+        dst = TRASH / f"{p.name}.{n}"
+        n += 1
+    shutil.move(str(p), str(dst))
+
+
+# ---------- 会话索引合并 ----------
+def org_dirs(profile):
+    base = ROOT / profile / "claude-code-sessions"
+    out = []
+    if not base.is_dir():
+        return out
+    for acct in sorted(base.iterdir()):
+        if not acct.is_dir() or acct.is_symlink():
+            continue
+        for org in sorted(acct.iterdir()):
+            if org.is_dir() and not org.is_symlink() and "_backup" not in org.name:
+                out.append(org)
+    return out
+
+
+def read_meta(p):
+    mt = p.stat().st_mtime
+    try:
+        j = json.loads(p.read_text("utf-8"))
+        la = j.get("lastActivityAt")
+        la = la if isinstance(la, (int, float)) else -1
+        return la, mt, j.get("cliSessionId"), j.get("isArchived") is True
+    except Exception:
+        return -1, mt, None, False
+
+
+def archived_set(d):
+    s = set()
+    for f in d.glob("local_*.json"):
+        if read_meta(f)[3]:
+            s.add(f.stem)
+    return s
+
+
+def plan_sync():
+    dirs = [(prof, d) for prof in profiles() for d in org_dirs(prof)]
+    cand = {}
+    for _, d in dirs:
+        for f in d.glob("local_*.json"):
+            la, mt, cli, _arch = read_meta(f)
+            cand.setdefault(f.name, []).append(((la, mt), cli, f))
+    actions, conflicts, tomb = [], [], 0
+    for name, lst in sorted(cand.items()):
+        sid = name[len("local_"):-5]
+        top_la = max(t[0][0] for t in lst)
+        tops = [t for t in lst if t[0][0] == top_la]
+        clis = {t[1] for t in tops if t[1]}
+        if len(clis) > 1:
+            conflicts.append((name, sorted(clis)))
+            continue
+        win = max(tops, key=lambda t: t[0])
+        for _, d in dirs:
+            dst = d / name
+            if (d / f"deleted_{sid}").exists():
+                if not dst.exists():
+                    tomb += 1
+                continue
+            if dst == win[2]:
+                continue
+            if not dst.exists():
+                actions.append(("新增", name, win[2], d))
+            elif dst.read_bytes() != win[2].read_bytes():
+                if read_meta(dst)[:2] < win[0]:
+                    actions.append(("更新", name, win[2], d))
+    return dirs, actions, conflicts, tomb
+
+
+def summarize_sync(actions, conflicts, tomb):
+    add = sum(1 for a in actions if a[0] == "新增")
+    upd = sum(1 for a in actions if a[0] == "更新")
+    print(f"会话索引合并：新增 {add} 处、更新 {upd} 处；"
+          f"指针冲突（不动）{len(conflicts)} 个；因删除标记跳过 {tomb} 处")
+    for name, clis in conflicts[:5]:
+        print(f"  ⚠️ 冲突 {name}：活动时间相同但指向不同转录 {clis}")
+    return add, upd
+
+
+def apply_sync(dirs, actions):
+    if not actions:
+        return
+    bdir = ROOT / "_backups" / RUN_TS
+    touched = {}
+    for _, name, _win, d in actions:
+        touched.setdefault(d, []).append(name)
+    # idx 一致性：只有合并前 idx 与文件完全自洽、且格式是 {"v":1,"archived":[...]} 才会重写
+    idx_plan = {}
+    for d in touched:
+        idx = d / "archived-sessions.idx"
+        if idx.exists():
+            try:
+                j = json.loads(idx.read_text("utf-8"))
+                if set(j) == {"v", "archived"} and j["v"] == 1 and set(j["archived"]) == archived_set(d):
+                    idx_plan[d] = True
+                else:
+                    idx_plan[d] = False
+            except Exception:
+                idx_plan[d] = False
+    # 先备份将被覆盖的文件和 idx
+    for d, names in touched.items():
+        rel = d.relative_to(ROOT)
+        (bdir / rel).mkdir(parents=True, exist_ok=True)
+        for n in names:
+            if (d / n).exists():
+                shutil.copy2(d / n, bdir / rel / n)
+        if (d / "archived-sessions.idx").exists():
+            shutil.copy2(d / "archived-sessions.idx", bdir / rel / "archived-sessions.idx")
+    for _kind, name, win, d in actions:
+        dst = d / name
+        tmp = d / f".{name}.switch-tmp"
+        shutil.copy2(win, tmp)
+        os.replace(tmp, dst)
+    for d, ok in idx_plan.items():
+        if ok:
+            new = sorted(archived_set(d))
+            tmp = d / ".archived-sessions.idx.switch-tmp"
+            tmp.write_text(json.dumps({"v": 1, "archived": new}, separators=(",", ":")), "utf-8")
+            os.replace(tmp, d / "archived-sessions.idx")
+        else:
+            print(f"  ℹ️ {d.relative_to(ROOT)} 的归档索引与文件不自洽或格式未知，未改动")
+    print(f"已备份被覆盖的文件到 {bdir}")
+
+
+def rotate_backups():
+    """只保留最近 KEEP_BACKUPS 份，旧的进废纸篓（可恢复）。"""
+    b = ROOT / "_backups"
+    if not b.is_dir():
+        return
+    allb = sorted(p for p in b.iterdir() if re.fullmatch(r"\d{8}_\d{6}", p.name))
+    for p in allb[:-KEEP_BACKUPS]:
+        to_trash(p)
+
+
+# ---------- 共享状态：目录链接 ----------
+def plan_links():
+    """SHARED_DIRS 里每个目录：选内容最多的真实目录当「本体」，其他档案放相对符号链接指向它。
+    返回 (动作, 冲突)。动作 = (名字, 档案, 本体路径, 是否要先删掉空目录)"""
+    acts, confl = [], []
+    profs = profiles()
+    for name in SHARED_DIRS:
+        real = {}
+        for p in profs:
+            d = ROOT / p / name
+            if d.is_dir() and not d.is_symlink():
+                real[p] = sum(1 for _ in d.iterdir())
+        full = {p: n for p, n in real.items() if n > 0}
+        if not full:
+            continue
+        home = max(sorted(full), key=lambda p: full[p])
+        for p in profs:
+            if p == home:
+                continue
+            d = ROOT / p / name
+            if d.is_symlink():
+                if d.resolve() != (ROOT / home / name).resolve():
+                    confl.append(f"{p}/{name} 是符号链接但指向别处：{os.readlink(d)}")
+            elif not d.exists():
+                acts.append((name, p, ROOT / home / name, False))
+            elif d.is_dir() and real.get(p) == 0:
+                acts.append((name, p, ROOT / home / name, True))
+            elif d.is_dir():
+                confl.append(f"{p}/{name} 里已有 {real[p]} 项内容，和 {home}/{name} 各是一份，需要你手动合并后再同步")
+    return acts, confl
+
+
+def apply_links(acts):
+    for name, p, home, rm_empty in acts:
+        d = ROOT / p / name
+        if rm_empty:
+            d.rmdir()                      # 只会删空目录；非空会抛异常而不是误删
+        os.symlink(os.path.relpath(home, d.parent), d)
+
+
+# ---------- 共享状态：配置文件（侧边栏分组等）与 worktree 登记表 ----------
+def load_json_file(f):
+    try:
+        txt = f.read_text("utf-8")
+    except FileNotFoundError:
+        return None, None
+    try:
+        return json.loads(txt), txt
+    except Exception as e:
+        die(f"{f} 不是合法 JSON（{e}），已中止，未改动任何文件。")
+
+
+def dump_like(obj, orig):
+    """保持原文件的缩进风格和结尾换行。"""
+    ind = "\t" if orig.startswith("{\n\t") else (2 if orig.startswith("{\n  ") else None)
+    s = json.dumps(obj, ensure_ascii=False, indent=ind, separators=(",", ": ") if ind else (",", ":"))
+    return s + ("\n" if orig.endswith("\n") else "")
+
+
+def short_key(k):
+    a, _, o = k.partition("/")
+    return f"{a[:8]}/{o[:8]}"
+
+
+def ui_payload(cfg):
+    """从一个档案的配置里取出要共享的侧边栏数据；没有自定义分组则返回 None。"""
+    ep = cfg.get("preferences", {}).get("epitaxyPrefs", {})
+    gs = ep.get("dframe-group-scopes", {})
+    ks = [k for k, v in gs.items() if isinstance(v, dict) and v.get("groups")]
+    if not ks:
+        return None
+    k = max(ks, key=lambda k: len(gs[k].get("assignments", {})))
+    sl = ep.get("dframe-local-slice", {})
+    return {"scope": k, "group": gs[k], "section": ep.get("dframe-code-sections", {}).get(k),
+            "pinned": sl.get("pinnedOrder", []), "home": sl.get("homeProjectsPinnedOrder", []),
+            "starred": ep.get("starred-local-code-sessions", [])}
+
+
+def pick_ui_source(cfgs, ui_from):
+    """源 = 当前档案（刚被你改过），它没有分组才退而求其次；候选互相不同则要求 --ui-from。"""
+    if ui_from:
+        if ui_from not in cfgs or ui_payload(cfgs[ui_from]) is None:
+            die(f"--ui-from {ui_from}：该档案没有可用的侧边栏分组。")
+        return ui_from
+    cur = active()
+    if cur in cfgs and ui_payload(cfgs[cur]) is not None:
+        return cur
+    cands = [p for p in cfgs if ui_payload(cfgs[p]) is not None]
+    if not cands:
+        return None
+    if len({json.dumps(ui_payload(cfgs[p]), sort_keys=True) for p in cands}) > 1:
+        die(f"{', '.join(cands)} 的侧边栏分组各不相同，我不替你选。用 --ui-from <档案> 指定以谁为准。")
+    return cands[0]
+
+
+def plan_state(ui_from=None):
+    """算出要写的配置文件改动：[(档案, 文件, 新文本, 旧文本, [说明])]"""
+    out, notes = [], []
+    profs = profiles()
+    cfgs = {}
+    for p in profs:
+        d, t = load_json_file(ROOT / p / "claude_desktop_config.json")
+        if d is not None:
+            cfgs[p] = (d, t)
+    src = pick_ui_source({p: v[0] for p, v in cfgs.items()}, ui_from)
+    changes = {p: [] for p in cfgs}
+    new = {p: json.loads(json.dumps(cfgs[p][0])) for p in cfgs}
+    if src:
+        pl = ui_payload(cfgs[src][0])
+        for p in cfgs:
+            if p == src:
+                skip = pl["scope"]
+            else:
+                skip = None
+            ep = new[p].setdefault("preferences", {}).setdefault("epitaxyPrefs", {})
+            gs = ep.setdefault("dframe-group-scopes", {})
+            cs = ep.setdefault("dframe-code-sections", {})
+            keys = (set(gs) | set(cs)) - {skip}
+            if not keys:
+                notes.append(f"档案 {p} 还没有任何账号的侧边栏数据（没登录或没打开过），先登录一次再同步")
+            for k in sorted(keys):
+                if gs.get(k) != pl["group"]:
+                    gs[k] = json.loads(json.dumps(pl["group"]))
+                    changes[p].append(f"{short_key(k)}：{len(pl['group']['groups'])} 个分组、"
+                                      f"{len(pl['group'].get('assignments', {}))} 个会话归属")
+                if pl["section"] is not None and k in cs and cs[k] != pl["section"]:
+                    cs[k] = json.loads(json.dumps(pl["section"]))
+                    changes[p].append(f"{short_key(k)}：侧边栏分区")
+            if p != src:
+                sl = ep.setdefault("dframe-local-slice", {})
+                for key, val, label in (("pinnedOrder", pl["pinned"], "置顶"),
+                                        ("homeProjectsPinnedOrder", pl["home"], "项目置顶")):
+                    if val and sl.get(key) != val:
+                        sl[key] = list(val)
+                        changes[p].append(f"{label} {len(val)} 项")
+                if pl["starred"] and ep.get("starred-local-code-sessions") != pl["starred"]:
+                    ep["starred-local-code-sessions"] = list(pl["starred"])
+                    changes[p].append(f"星标 {len(pl['starred'])} 项")
+        s_pref = cfgs[src][0].get("preferences", {})
+        s_ep = s_pref.get("epitaxyPrefs", {})
+        for p in cfgs:
+            if p == src:
+                continue
+            pref = new[p].setdefault("preferences", {})
+            ep = pref.setdefault("epitaxyPrefs", {})
+            filled = [k for k in GAPFILL_TOP if k in s_pref and k not in pref]
+            for k in filled:
+                pref[k] = s_pref[k]
+            f2 = [k for k in GAPFILL_EP if k in s_ep and k not in ep]
+            for k in f2:
+                ep[k] = s_ep[k]
+            if filled or f2:
+                changes[p].append(f"补齐界面偏好 {len(filled) + len(f2)} 项")
+    for p in cfgs:
+        if changes[p]:
+            f = ROOT / p / "claude_desktop_config.json"
+            out.append((p, f, dump_like(new[p], cfgs[p][1]), cfgs[p][1], changes[p]))
+    # worktree 登记表：按名字取并集（同名取时间更新的那条）
+    wt = {}
+    for p in profs:
+        d, t = load_json_file(ROOT / p / "git-worktrees.json")
+        if d is not None:
+            wt[p] = (d, t)
+    merged = {"worktrees": ("createdAt", {}), "originPins": ("mintedAt", {})}
+    for p in wt:
+        for sec, (tkey, acc) in merged.items():
+            for k, v in (wt[p][0].get(sec) or {}).items():
+                if k not in acc or (v.get(tkey) or 0) > (acc[k].get(tkey) or 0):
+                    acc[k] = v
+    for p in wt:
+        d = json.loads(json.dumps(wt[p][0]))
+        ch = []
+        for sec, (_t, acc) in merged.items():
+            cur = d.get(sec) or {}
+            add = [k for k in acc if cur.get(k) != acc[k]]
+            if add:
+                cur.update({k: acc[k] for k in add})
+                d[sec] = cur
+                ch.append(f"{sec} +{len(add)}")
+        if ch:
+            out.append((p, ROOT / p / "git-worktrees.json", dump_like(d, wt[p][1]), wt[p][1], ["worktree 登记表 " + "、".join(ch)]))
+    return out, notes, src
+
+
+def apply_state(items):
+    for p, f, newtxt, oldtxt, _ in items:
+        b = ROOT / "_backups" / RUN_TS / p
+        b.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, b / f.name)
+        tmp = f.with_name(f".{f.name}.switch-tmp")
+        tmp.write_text(newtxt, "utf-8")
+        shutil.copymode(f, tmp)
+        os.replace(tmp, f)
+
+
+def sync_everything(go, ui_from=None):
+    """会话索引 + 共享目录 + 配置状态。go=False 只预演并打印。返回 (dirs, actions, links, state_items)。"""
+    dirs, actions, conflicts, tomb = plan_sync()
+    print(f"参与合并的会话目录 {len(dirs)} 个：" + "、".join(f"{p}/{d.parent.name[:8]}/{d.name[:8]}" for p, d in dirs))
+    summarize_sync(actions, conflicts, tomb)
+    links, lconf = plan_links()
+    print(f"共享目录：需要建立链接 {len(links)} 个" + "".join(f"\n  + {p}/{n} → {h}" for n, p, h, _ in links))
+    for c in lconf:
+        print(f"  ⚠️ {c}")
+    items, notes, src = plan_state(ui_from)
+    print(f"侧边栏/偏好/worktree：以 {src or '（无档案有自定义分组）'} 为准，需改 {len(items)} 个文件"
+          + "".join(f"\n  ~ {p}/{f.name}：" + "；".join(ch) for p, f, _n, _o, ch in items))
+    for n in notes:
+        print(f"  ℹ️ {n}")
+    return dirs, actions, links, items
+
+
+def cmd_sync(go, ui_from=None):
+    check_init()
+    dirs, actions, links, items = sync_everything(go, ui_from)
+    if not go:
+        print("（预演，未修改任何文件。确认后加 --go）")
+        return
+    require_quit()
+    apply_sync(dirs, actions)
+    apply_links(links)
+    apply_state(items)
+    rotate_backups()
+    print("完成。")
+
+
+# ---------- init / add / use / uninstall / status ----------
+def cmd_init(name, go):
+    check_name(name)
+    if active() is not None:
+        die("已经初始化过了（Claude 目录已是符号链接）。")
+    if not LIVE.is_dir() or LIVE.is_symlink():
+        die(f"找不到真实的数据目录：{LIVE}")
+    if (ROOT / name).exists():
+        die(f"档案 {name} 已存在：{ROOT / name}")
+    print(f"将执行：\n  1. 把 {LIVE}\n     改名为 {ROOT / name}（同一磁盘上的改名，瞬间完成，不复制数据）"
+          f"\n  2. 在 {LIVE} 放一个符号链接指向它")
+    if not go:
+        print("（预演，未修改任何文件。确认后加 --go；先退出 Claude）")
+        return
+    require_quit()
+    ROOT.mkdir(parents=True, exist_ok=True)
+    if LIVE.stat().st_dev != ROOT.stat().st_dev:
+        die("数据目录和 Claude-Profiles 不在同一磁盘，改名会变成整盘复制，已中止。")
+    os.rename(LIVE, ROOT / name)
+    try:
+        os.symlink(ROOT / name, LIVE)
+    except Exception as e:
+        os.rename(ROOT / name, LIVE)
+        die(f"创建符号链接失败，已还原：{e}")
+    print(f"完成。当前档案：{name}。")
+
+
+def cmd_add(name, go, seed_vm):
+    check_name(name)
+    check_init()
+    if (ROOT / name).exists():
+        die(f"档案 {name} 已存在。")
+    src = ROOT / active()
+    items = SEED_DEFAULT + (SEED_VM if seed_vm else [])
+    seeds = [i for i in items if (src / i).exists()]
+    print(f"将新建空档案 {ROOT / name}，并用 APFS 克隆（不占额外空间）从当前档案预置：{seeds or '无'}"
+          f"\n并把 {'、'.join(SHARED_DIRS)} 链接到现有档案的同一份目录（无文件夹会话才不会报找不到工作目录）")
+    if not seed_vm:
+        print("  （vm_bundles 约 10GB，Cowork 才用；需要时加 --seed-vm）")
+    if not go:
+        print("（预演，未修改任何文件。确认后加 --go；先退出 Claude）")
+        return
+    require_quit()
+    (ROOT / name).mkdir(parents=True)
+    free0 = shutil.disk_usage(ROOT).free
+    for i in seeds:
+        r = subprocess.run(["cp", "-Rc", str(src / i), str(ROOT / name / i)])
+        if r.returncode != 0:
+            print(f"  ⚠️ 预置 {i} 失败（不影响使用，首次启动会自行下载）")
+    used = (free0 - shutil.disk_usage(ROOT).free) / 1e6
+    links, lconf = plan_links()
+    mine = [a for a in links if a[1] == name]
+    apply_links(mine)
+    for c in lconf:
+        print(f"  ⚠️ {c}")
+    print(f"完成。预置实际占用约 {used:.0f} MB；共享目录链接 {len(mine)} 个。"
+          f"切到 {name} 后首次需要登录一次：claude-switch use {name} --go")
+
+
+def repoint(name):
+    tmp = ASUP / ".Claude.switch-tmp"
+    if tmp.is_symlink():
+        tmp.unlink()
+    os.symlink(ROOT / name, tmp)
+    os.replace(tmp, LIVE)           # 原子替换符号链接；LIVE 若是真实目录会报错，不会误伤
+
+
+def cmd_use(name, go, launch, ui_from=None):
+    check_name(name)
+    check_init()
+    if name not in profiles():
+        die(f"没有档案 {name}。现有：{', '.join(profiles()) or '无'}")
+    if inside_claude():
+        die("检测到是从 Claude 里面运行的。请在 Terminal.app 里运行（切换要退出 Claude，会连命令一起杀掉）。")
+    cur = active()
+    print(f"将执行：退出 Claude（如在运行）→ 同步共享状态 → 链接指向 {name}"
+          f"{'（已是当前档案，相当于刷新）' if cur == name else f'（当前 {cur}）'}"
+          f"{' → 重新打开 Claude' if launch else ''}")
+    sync_everything(go, ui_from)
+    if not go:
+        print("（预演，未修改任何文件，也没有退出 Claude。确认后加 --go）")
+        return
+    quit_app()
+    # 退出时 App 可能还在收尾改写配置，所以改动在退出之后重新计算
+    dirs, actions, _c, _t = plan_sync()
+    links, _lc = plan_links()
+    items, _n, _s = plan_state(ui_from)
+    apply_sync(dirs, actions)
+    apply_links(links)
+    apply_state(items)
+    rotate_backups()
+    repoint(name)
+    print(f"已切换到 {name}。")
+    if launch:
+        launch_app()
+
+
+def cmd_uninstall(go):
+    check_init()
+    cur = active()
+    print(f"将执行：删除符号链接 {LIVE}，把档案 {cur} 改名回 {LIVE}；其他档案留在 {ROOT}。")
+    if not go:
+        print("（预演，未修改任何文件。确认后加 --go；先退出 Claude）")
+        return
+    require_quit()
+    LIVE.unlink()
+    try:
+        os.rename(ROOT / cur, LIVE)
+    except Exception as e:
+        os.symlink(ROOT / cur, LIVE)
+        die(f"还原失败，已恢复符号链接：{e}")
+    print(f"完成。{LIVE} 现在是真实目录（原档案 {cur}）。")
+
+
+def is_prefix(small, big):
+    """small 是否是 big 的开头部分（按字节）。"""
+    with open(small, "rb") as x, open(big, "rb") as y:
+        while True:
+            c = x.read(1 << 20)
+            if not c:
+                return True
+            if y.read(len(c)) != c:
+                return False
+
+
+def cmd_doctor():
+    """找出「同一个会话 id 的转录出现在多个 ~/.claude/projects 子文件夹里、内容不同」的会话。
+    成因：同一个工作目录因路径里有符号链接，被记成两种写法（如 /Volumes/MyDisk/… 与它的符号链接，
+    或数据目录改成符号链接后的 Claude 与 Claude-Profiles/a），转录就写进了两个文件夹，各有一部分。
+    界面显示哪一份由 App 决定，可能是较旧、被截断的那份。本命令只读，不改任何文件。"""
+    check_init()
+    titles = {}
+    for prof in profiles():
+        for d in org_dirs(prof):
+            for f in d.glob("local_*.json"):
+                try:
+                    j = json.loads(f.read_text("utf-8"))
+                except Exception:
+                    continue
+                if j.get("cliSessionId"):
+                    titles.setdefault(j["cliSessionId"], j.get("title") or "(无标题)")
+    by = {}
+    for f in PROJECTS.glob("*/*.jsonl"):
+        by.setdefault(f.stem, []).append(f)
+    dup = {k: v for k, v in by.items() if len(v) > 1}
+    shown = 0
+    for sid, fs in sorted(dup.items()):
+        fs = sorted(fs, key=lambda x: x.stat().st_size)
+        small, big = fs[0], fs[-1]
+        if small.stat().st_size == big.stat().st_size and is_prefix(small, big):
+            continue                                   # 内容完全相同，无所谓
+        if shown == 0:
+            print(f"转录文件共 {sum(len(v) for v in by.values())} 个；同一会话出现在多个文件夹且内容不同：")
+        shown += 1
+        verdict = ("较小的是较大的开头部分，较大的那份是完整的" if is_prefix(small, big)
+                   else "两份各有对方没有的内容，需要人工合并，不能直接覆盖")
+        print(f"  ⚠️ {titles.get(sid, '(索引里没有)')[:30]}（{sid[:8]}）：{verdict}")
+        for f in fs:
+            print(f"       {f.stat().st_size // 1024:>6}KB  …{f.parent.name[-45:]}")
+    if shown == 0:
+        print(f"转录文件共 {sum(len(v) for v in by.values())} 个；没有发现分裂的会话。")
+    else:
+        print(f"共 {shown} 个会话有分裂。建议：先别在这些会话里继续聊长内容，把较大的那份另存备份。本命令只报告，不改任何文件。")
+
+
+def cmd_status():
+    if LIVE.is_symlink():
+        a = active()
+        print(f"数据目录：符号链接 → {LIVE.resolve()}（当前档案：{a or '不在 Claude-Profiles 下！'}）")
+    elif LIVE.is_dir():
+        print(f"数据目录：真实目录（未初始化）{LIVE}")
+    else:
+        print(f"数据目录：不存在 {LIVE}")
+    for p in profiles():
+        n = sum(len(list(d.glob('local_*.json'))) for d in org_dirs(p))
+        mark = "◀ 当前" if p == active() else ""
+        print(f"  档案 {p:<12} 会话索引 {n:>5} 个  {mark}")
+    for n in SHARED_DIRS:
+        for p in profiles():
+            d = ROOT / p / n
+            if d.is_symlink():
+                st = f"链接 → {os.readlink(d)}"
+            elif d.is_dir():
+                st = f"真实目录，{sum(1 for _ in d.iterdir())} 项"
+            else:
+                st = "缺失"
+            print(f"  共享目录 {p}/{n}: {st}")
+    for p in profiles():
+        d, _t = load_json_file(ROOT / p / "claude_desktop_config.json")
+        pl = ui_payload(d) if d else None
+        desc = (f"{len(pl['group']['groups'])} 个分组、{len(pl['group'].get('assignments', {}))} 个归属"
+                if pl else "无")
+        print(f"  侧边栏分组 {p:<12} {desc}")
+    print(f"Claude Desktop：{'运行中' if app_running() else '未运行'}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="claude-switch", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", choices=["status", "doctor", "init", "add", "use", "sync", "uninstall"])
+    ap.add_argument("name", nargs="?")
+    ap.add_argument("--go", action="store_true", help="真正执行（默认只预演）")
+    ap.add_argument("--no-launch", action="store_true", help="use 之后不自动重新打开 Claude")
+    ap.add_argument("--ui-from", metavar="档案", help="侧边栏分组以哪个档案为准（默认：当前档案）")
+    ap.add_argument("--seed-vm", action="store_true", help="add 时也克隆 vm_bundles（约 10GB，APFS 克隆不占空间）")
+    a = ap.parse_args()
+    if a.cmd in ("init", "add", "use") and not a.name:
+        die(f"{a.cmd} 需要档案名。")
+    if a.cmd == "status":
+        cmd_status()
+    elif a.cmd == "doctor":
+        cmd_doctor()
+    elif a.cmd == "init":
+        cmd_init(a.name, a.go)
+    elif a.cmd == "add":
+        cmd_add(a.name, a.go, a.seed_vm)
+    elif a.cmd == "use":
+        cmd_use(a.name, a.go, not a.no_launch, a.ui_from)
+    elif a.cmd == "sync":
+        cmd_sync(a.go, a.ui_from)
+    elif a.cmd == "uninstall":
+        cmd_uninstall(a.go)
+
+
+if __name__ == "__main__":
+    main()

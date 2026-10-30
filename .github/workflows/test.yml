@@ -1,0 +1,10 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  sandbox:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run sandbox tests
+        run: |
+          for t in tests/test_*.py; do python3 "$t" || exit 1; done
